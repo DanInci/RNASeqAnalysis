@@ -2,7 +2,8 @@
 title: "GSE96058 Breast Cancer RNA-seq Dataset"
 author: "Daniel Incicau"
 date: "2025-07-18"
-output: 
+output:
+  pdf_document: default
   html_document: defaults
 params:
   seed: 69
@@ -16,25 +17,19 @@ knitr::opts_chunk$set(fig.width=12, fig.height=12, warning=FALSE, message=FALSE,
 SEED = params$seed
 set.seed(SEED)
 
-options(repos = c(CRAN = "https://cran.rstudio.com/"))
-required_packages <- c(
-  "tidyverse", "data.table", "readr", "umap", "Rtsne", "GEOquery", "ggplot2", "pheatmap", "patchwork"
-)
-
-new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
-if(length(new_packages)) install.packages(new_packages)
-
-# Load Bioconductor packages
-if (!require("BiocManager", quietly = TRUE)) {
-  install.packages("BiocManager")
-}
-
-bioc_packages <- c("limma", "edgeR")
-BiocManager::install(bioc_packages[!bioc_packages %in% installed.packages()[,"Package"]])
-
-# Load all packages
-lapply(c(required_packages, bioc_packages), library, character.only = TRUE)
+library(tidyverse)
+library(data.table)
+library(readr)
+library(umap)
+library(Rtsne)
+library(GEOquery)
+library(ggplot2)
+library(pheatmap)
+library(patchwork)
+library(cluster)
+library(mclust) 
 ```
+
 
 ## Phase 1: Data Download & Preprocessing
 
@@ -52,13 +47,90 @@ genes <- expression_data$V1
 expression_matrix <- as.matrix(expression_data[, -1])
 rownames(expression_matrix) <- genes
 
+# Clinical Data
+clinical_data_hiSeq <- pData(gse[[1]])
+clinical_data_nextSeq <- pData(gse[[2]])
+clinical_data <- rbind(clinical_data_hiSeq, clinical_data_nextSeq)
+rownames(clinical_data) <- clinical_data[[1]]
+clinical_data$sample_id <- rownames(clinical_data)
+```
+
+### 1.2 Prepare & Filter Data
+
+```{r}
+clean_clinical_data <- function(clinical_df) {
+  colnames(clinical_df) <- make.names(colnames(clinical_df))
+  colnames(clinical_df) <- gsub("\\.ch1", "", colnames(clinical_df))
+  colnames(clinical_df) <- gsub("\\.+", "_", colnames(clinical_df))
+  colnames(clinical_df) <- tolower(colnames(clinical_df))
+  
+  clinical_df_clean <- clinical_df %>%
+    select(
+      sample_id,
+      age_at_diagnosis,
+      tumor_size,
+      lymph_node_status,
+      er_status,
+      pgr_status,
+      her2_status,
+      ki67_status,
+      nhg,
+      pam50_subtype,
+      overall_survival_days,
+      overall_survival_event
+    )
+  
+  clinical_df_clean <- clinical_df_clean %>%
+    mutate(
+      age_at_diagnosis = as.numeric(age_at_diagnosis),
+      tumor_size = as.numeric(tumor_size),
+      er_status = as.factor(er_status),
+      pgr_status = as.factor(pgr_status),
+      her2_status = as.factor(her2_status),
+      ki67_status = as.factor(ki67_status),
+      nhg = as.factor(nhg),
+      pam50_subtype = as.factor(pam50_subtype),
+      overall_survival_days = as.numeric(overall_survival_days),
+      overall_survival_event = as.factor(overall_survival_event),
+      lymph_node_status = as.factor(lymph_node_status)
+    )
+  
+  return(clinical_df_clean)
+}
+
+filter_low_expression_genes <- function(
+    expression_matrix,
+    min_log2_expr = 1,          # Minimum log2 expression level
+    min_sample_fraction = 0.1   # Fraction of samples that must express the gene
+    ) {
+  
+  original_genes <- nrow(expression_matrix)
+  min_samples <- ceiling(ncol(expression_matrix) * min_sample_fraction)
+  samples_expressing <- rowSums(expression_matrix >= min_log2_expr)
+  
+  # Keep genes expressed in sufficient samples
+  keep_expressed <- samples_expressing >= min_samples
+  
+  expression_filtered <- expression_matrix[keep_expressed, ]
+  
+  cat("Genes passing expression filter:", sum(keep_expressed), 
+      "(", round(sum(keep_expressed)/original_genes*100, 1), "%)\n")
+  cat("Genes removed:", sum(!keep_expressed), "\n\n")
+  
+  return(expression_filtered)
+}
+
 # Remove technical replicates (keep primary samples) 
 primary_samples <- colnames(expression_matrix)[!grepl("repl", colnames(expression_matrix))]
 expression_matrix <- expression_matrix[, primary_samples]
 
-# Clinical Data
-clinical_data <- pData(gse[[1]])
-rownames(clinical_data) <- clinical_data[[1]]
+# Filter low expression genes
+# log2(FPKM) > 0 means FPKM > 1
+# Expressed in ≥10% of samples (≥341 samples)
+expression_matrix <- filter_low_expression_genes(expression_matrix, min_log2_expr=0, min_sample_fraction=0.1)
+
+# Clean clinical data
+clinical_df <- clean_clinical_data(clinical_data)
 
 # Remove not matching expression and clinical data
 common_samples <- intersect(colnames(expression_matrix), rownames(clinical_df))
@@ -74,9 +146,10 @@ cat("Clinical variables:", ncol(clinical_data), "\n")
 cat("Expression range:", 
     round(min(expression_matrix, na.rm = TRUE), 2), "to", 
     round(max(expression_matrix, na.rm = TRUE), 2), "\n")
+
 ```
 
-### 1.2 Quality Control Visualizations
+### 1.3 Quality Control Visualizations
 
 ```{r fig.width=12, fig.height=12}
 set.seed(SEED)
@@ -131,61 +204,30 @@ colnames(expr_subset_df) <- c("Gene", "Sample", "Expression")
 # Violin plot of expression per sample
 p_violin <- ggplot(expr_subset_df, aes(x = Sample, y = Expression)) +
   geom_violin(fill = "lightblue", alpha = 0.7) +
-  labs(title = "Expression Distribution (Violin Plot)", y = "log2(FPKM + 0.1)") +
+  labs(title = "Expression Distribution", y = "log2(FPKM + 0.1)") +
   theme_minimal() +
   theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
 
 p_violin
 ```
 
-
 ## Stage 2: Data Exploration & Visualisation
 
 ### 2.1 Dimensionality Reduction and Visualization
+
+Compute low-dimensinal embeddings for expresion matrix (PCA, UMAP)
 
 ```{r}
 set.seed(SEED)
 
 # PCA
 pca_result <- prcomp(t(expression_matrix), center = TRUE, scale. = TRUE)
-pc_scores <- data.frame(pca_result$x[, 1:3], sample_id = rownames(pca_result$x))
-pc_scores <- left_join(pc_scores, clinical_df, by = "sample_id")
+pc_scores_df <- data.frame(pca_result$x[, 1:3], sample_id = rownames(pca_result$x))
+pc_scores_df <- left_join(pc_scores_df, clinical_df, by = "sample_id")
 
 # Variance explained
 var_explained <- (pca_result$sdev^2 / sum(pca_result$sdev^2)) * 100
-
-# PCA plot
-p_pca <- ggplot(pc_scores, aes(x = PC1, y = PC2)) +
-    geom_point(alpha = 0.7, size = 2) +
-    labs(title = "PCA of Gene Expression Data",
-         x = paste0("PC1 (", round(var_explained[1], 2), "%)"),
-         y = paste0("PC2 (", round(var_explained[2], 2), "%)")) +
-    theme_minimal()
-
-# Scree plot (top 20 PCs)
-scree_data <- data.frame(
-  PC = paste0("PC", 1:20),
-  Variance = var_explained[1:20]
-)
-
-p_scree <- ggplot(scree_data, aes(x = reorder(PC, -Variance), y = Variance)) +
-  geom_col(fill = "steelblue") +
-  geom_text(aes(label = round(Variance, 1)), vjust = -0.5, size = 3) +
-  labs(title = "Scree Plot", x = "Principal Component", y = "Variance Explained (%)") +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-# t-SNE
-tsne_result <- Rtsne(t(expression_matrix), dims = 2, perplexity = 30, verbose = FALSE)
-tsne_df <- data.frame(tsne_result$Y)
-colnames(tsne_df) <- c("tSNE1", "tSNE2")
-tsne_df$sample_id <- colnames(expression_matrix)
-tsne_df <- left_join(tsne_df, clinical_df, by = "sample_id")
-
-p_tsne <- ggplot(tsne_df, aes(x = tSNE1, y = tSNE2, color = .data[[color_var]])) +
-  geom_point(alpha = 0.7, size = 2) +
-  labs(title = "t-SNE of Gene Expression Data", color = color_var) +
-  theme_minimal()
+cumulative_variance <- cumsum(var_explained)
 
 # UMAP
 umap_result <- umap(t(expression_matrix))
@@ -193,19 +235,261 @@ umap_df <- data.frame(UMAP1 = umap_result$layout[,1],
                       UMAP2 = umap_result$layout[,2],
                       sample_id = colnames(expression_matrix))
 umap_df <- left_join(umap_df, clinical_df, by = "sample_id")
+```
 
-p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = .data[[color_var]])) +
+Visualise low-dimensional embeddings by clinical subtype (PAM50)
+
+```{r}
+p_pca <- ggplot(pc_scores_df, aes(x = PC1, y = PC2, color = .data[["pam50_subtype"]])) +
+    geom_point(alpha = 0.7, size = 2) +
+    labs(title = "PCA of Gene Expression Data",
+         x = paste0("PC1 (", round(var_explained[1], 2), "%)"),
+         y = paste0("PC2 (", round(var_explained[2], 2), "%)")) +
+    theme_minimal()
+
+p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["pam50_subtype"]])) +
   geom_point(alpha = 0.7, size = 2) +
-  labs(title = "UMAP of Gene Expression Data", color = color_var) +
+  labs(title = "UMAP of Gene Expression Data", color = "pam50_subtype") +
   theme_minimal()
 
 p_pca
-p_scree
-p_tsne
 p_umap
 ```
 
+Visualise low-dimensional embeddings by sample_id (check batch effects)
+
+```{r}
+
+p_pca <- ggplot(pc_scores_df, aes(x = PC1, y = PC2, color = .data[["sample_id"]])) +
+    geom_point(alpha = 0.7, size = 2) +
+    labs(title = "PCA of Gene Expression Data",
+         x = paste0("PC1 (", round(var_explained[1], 2), "%)"),
+         y = paste0("PC2 (", round(var_explained[2], 2), "%)")) +
+    theme_minimal() + 
+    theme(legend.position = "none")
+
+
+p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["sample_id"]])) +
+  geom_point(alpha = 0.7, size = 2) +
+  labs(title = "UMAP of Gene Expression Data", color = "sample_id") +
+  theme_minimal() + 
+  theme(legend.position = "none")
+
+p_pca
+p_umap
+```
+
+Visualize variance explained plots
+
+```{r}
+# Scree plot (top 20 PCs)
+scree_data <- data.frame(
+  PC = paste0("PC", 1:20),
+  Variance = var_explained[1:20]
+)
+
+p_variance <- ggplot(scree_data, aes(x = reorder(PC, -Variance), y = Variance)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(Variance, 1)), vjust = -0.5, size = 3) +
+  labs(title = "Varianice Explained", x = "Principal Component", y = "Variance Explained (%)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cumsum_df <- data.frame(
+  PC = 1:length(cumulative_variance),
+  CumulativeVariance = cumulative_variance
+)
+
+p_variance_cumsum <- ggplot(cumsum_df, aes(x = PC, y = CumulativeVariance)) +
+  geom_line(color = "steelblue", size = 1) +
+  geom_point(color = "steelblue", size = 2) +
+  geom_hline(yintercept = 90, linetype = "dashed", color = "red") +
+  annotate("text", x = max(cumsum_df$PC) - 5, y = 91.5, label = "90% threshold", color = "red", size = 3) +
+  labs(title = "Cumulative Variance Explained by PCs",
+       x = "Number of Principal Components",
+       y = "Cumulative Variance Explained (%)") +
+  theme_minimal()
+
+p_variance
+p_variance_cumsum
+```
+
 ## Stage 3: Analysis
+
+### Stage 3.1: Feature Selection
+
+Select only highly variable genes using the HVG method
+
+```{r}
+set.seed(SEED)
+
+# Mean-variance relationship (more robust)
+select_hvg_mean_var <- function(expression_matrix, top_n) {
+  gene_means <- rowMeans(expression_matrix)
+  gene_vars <- apply(expression_matrix, 1, var)
+  
+  # Fit loess curve to mean-variance relationship
+  mv_fit <- loess(gene_vars ~ gene_means, span = 0.3)
+  expected_var <- predict(mv_fit, gene_means)
+  
+  # Calculate standardized variance (observed/expected)
+  var_ratio <- gene_vars / expected_var
+  var_ratio[is.na(var_ratio)] <- 0
+  
+  # Select top genes by variance ratio
+  top_hvg_genes <- names(sort(var_ratio, decreasing = TRUE))[1:top_n]
+  return(list(genes = top_hvg_genes, var_ratio = var_ratio))
+}
+
+# Use HVG method (most robust for RNA-seq)
+# top_n = 1000 (explains 90% of the variance)
+hvg_result <- select_hvg_mean_var(expression_matrix, top_n = 1000)
+top_hvg_genes <- hvg_result$genes
+expression_selected <- expression_matrix[top_hvg_genes, ]
+
+cat("\nSelected", length(top_hvg_genes), "highly variable genes for clustering out of", nrow(expression_matrix), "\n")
+```
+
+Visualize selected genes
+
+```{r fig.width=8, fig.height=4}
+# 2. Visualize feature selection
+hvg_df <- data.frame(
+  gene_id = names(hvg_result$var_ratio),
+  mean_expr = rowMeans(expression_matrix),
+  variance = apply(expression_matrix, 1, var),
+  selected = names(hvg_result$var_ratio) %in% top_hvg_genes,
+  stringsAsFactors = FALSE
+)
+
+p_hvg_selection <- ggplot(hvg_df, aes(x = mean_expr, y = variance, color = selected)) +
+  geom_point(alpha = 0.6, size = 0.8) +
+  scale_color_manual(values = c("FALSE" = "lightgray", "TRUE" = "red")) +
+  geom_smooth(method = "loess", se = TRUE, color = "blue", linetype = "dashed") +
+  labs(title = "Highly Variable Gene Selection",
+       subtitle = paste("Selected", sum(hvg_df$selected), "genes (red points) out of", nrow(expression_matrix)),
+       x = "Mean Expression", y = "Variance", color = "Selected") +
+  theme_minimal()
+
+p_hvg_selection
+```
+Compute low-dimensinal embeddings for selected expresion matrix (PCA, UMAP)
+
+```{r}
+set.seed(SEED)
+
+# PCA
+pca_result <- prcomp(t(expression_selected), center = TRUE, scale. = TRUE)
+pc_scores_df <- data.frame(pca_result$x[, 1:3], sample_id = rownames(pca_result$x))
+pc_scores_df <- left_join(pc_scores_df, clinical_df, by = "sample_id")
+
+
+# UMAP
+umap_result <- umap(t(expression_selected))
+umap_df <- data.frame(UMAP1 = umap_result$layout[,1],
+                      UMAP2 = umap_result$layout[,2],
+                      sample_id = colnames(expression_selected))
+umap_df <- left_join(umap_df, clinical_df, by = "sample_id")
+```
+
+Visualise low-dimensional embeddings by clinical subtype (PAM50)
+
+```{r}
+p_pca <- ggplot(pc_scores_df, aes(x = PC1, y = PC2, color = .data[["pam50_subtype"]])) +
+    geom_point(alpha = 0.7, size = 2) +
+    labs(title = "PCA of Gene Expression Data",
+         x = paste0("PC1 (", round(var_explained[1], 2), "%)"),
+         y = paste0("PC2 (", round(var_explained[2], 2), "%)")) +
+    theme_minimal()
+
+p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["pam50_subtype"]])) +
+  geom_point(alpha = 0.7, size = 2) +
+  labs(title = "UMAP of Gene Expression Data", color = "pam50_subtype") +
+  theme_minimal()
+
+p_pca
+p_umap
+```
+### Stage 3.2: Feature Normalization
+
+Scale features using Z-score normalization
+
+```{r}
+processed <- t(scale(t(expression_selected)))
+var_after_scale <- apply(processed, 1, var, na.rm = TRUE)
+expression_scaled <- processed[var_after_scale > 0 & !is.na(var_after_scale), ]
+
+cat("After preprocessing:", nrow(expression_scaled), "genes,", ncol(expression_scaled), "samples\n")
+```
+
+### Stage 3.3: Clustering
+
+### 3.3.1 K-Means clustering
+
+```{r}
+set.seed(SEED)
+
+ari_scores <- numeric()
+cluster_assignments <- data.frame(
+  sample_id = colnames(expression_scaled),
+  true_label = clinical_df$pam50_subtype
+)
+
+# Run K-means for k = 3 to 7
+for (k in 3:7) {
+  cat("Run k-means clustering with k =", k)
+
+  km <- kmeans(t(expression_scaled), centers = k, nstart = 25)
+  cluster_assignments[[paste0("k=", k)]] <- km$cluster
+  
+  # Calculate ARI
+  ari <- adjustedRandIndex(km$cluster, clinical_df$pam50_subtype)
+  cat(". Result ARI =", ari, "\n")
+  
+  ari_scores[as.character(k)] <- ari
+}
+
+print("Adjusted Rand Index (ARI) for k-means clustering")
+print(ari_scores)
+
+write.csv(cluster_assignments, file = "kmeans_cluster_labels.csv", row.names = FALSE)
+```
+### 3.3.2 Hierarchical clustering
+
+```{r}
+set.seed(SEED)
+
+# Perform hierarchical clustering
+dist_matrix <- dist(t(expression_scaled), method = "euclidean")
+hc <- hclust(dist_matrix, method = "ward.D2")
+
+ari_scores <- numeric()
+hclust_assignments <- data.frame(
+  sample_id = colnames(expression_scaled),
+  true_label = clinical_df$pam50_subtype
+)
+
+# Cut the tree at different levels of k (3 to 7)
+for (k in 3:7) {
+  cat("Run hierarchical clustering with k =", k)
+
+  clusters <- cutree(hc, k = k)
+  hclust_assignments[[paste0("k=", k)]] <- clusters
+  
+  # Calculate ARI
+  ari <- adjustedRandIndex(clusters, clinical_df$pam50_subtype)
+  cat(". Result ARI =", ari, "\n")
+  
+  ari_scores[as.character(k)] <- ari
+}
+
+# Print ARI scores
+print("Adjusted Rand Index (ARI) for hierarchical clustering")
+print(ari_scores)
+
+# Save to CSV
+write.csv(hclust_assignments, file = "hclust_cluster_labels.csv", row.names = FALSE)
+```
 
 ---
 
