@@ -3,10 +3,10 @@ title: "GSE96058 Breast Cancer RNA-seq Dataset"
 author: "Daniel Incicau"
 date: "2025-07-18"
 output:
+  html_document: default
   pdf_document: default
-  html_document: defaults
 params:
-  seed: 69
+  seed: 3213124
 ---
 
 ## Setup and Package Installation
@@ -28,6 +28,8 @@ library(pheatmap)
 library(patchwork)
 library(cluster)
 library(mclust) 
+library(randomForest)
+library(caret)
 ```
 
 
@@ -79,6 +81,9 @@ clean_clinical_data <- function(clinical_df) {
       overall_survival_days,
       overall_survival_event
     )
+  
+  clinical_df_clean <- clinical_df_clean %>%
+    mutate(across(everything(), ~na_if(., "NA")))
   
   clinical_df_clean <- clinical_df_clean %>%
     mutate(
@@ -149,6 +154,23 @@ cat("Expression range:",
 
 ```
 
+Check missing data from clinical.
+
+```{r}
+missing_summary <- clinical_df %>%
+  select(
+    age_at_diagnosis, tumor_size, lymph_node_status, er_status, 
+    pgr_status, her2_status, ki67_status, nhg, pam50_subtype,
+    overall_survival_days, overall_survival_event
+  ) %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(Missing_Percentage = round(Missing_Count / nrow(clinical_df) * 100, 2)) %>%
+  arrange(desc(Missing_Count))
+
+print(missing_summary)
+```
+
 ### 1.3 Quality Control Visualizations
 
 ```{r fig.width=12, fig.height=12}
@@ -213,7 +235,39 @@ p_violin
 
 ## Stage 2: Data Exploration & Visualisation
 
-### 2.1 Dimensionality Reduction and Visualization
+### 2.1 Clinical Data
+
+Explore age distribution, tumor size and PAM50 subtype
+
+```{r fig.width=18, fig.height=6}
+p_age <- ggplot(clinical_df, aes(x = age_at_diagnosis)) +
+    geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+    geom_vline(xintercept = median(clinical_df$age_at_diagnosis, na.rm = TRUE), 
+               color = "red", linetype = "dashed") +
+    labs(title = "Age at Diagnosis Distribution", 
+         x = "Age (years)", y = "Count") +
+    theme_minimal()
+  
+p_tumor_size <- ggplot(clinical_df, aes(x = tumor_size)) +
+    geom_histogram(bins = 30, fill = "darkgreen", alpha = 0.7) +
+    geom_vline(xintercept = median(clinical_df$tumor_size, na.rm = TRUE), 
+               color = "red", linetype = "dashed") +
+    labs(title = "Tumor Size Distribution", 
+         x = "Tumor Size (mm)", y = "Count") +
+    theme_minimal()
+  
+p_pam50 <- ggplot(clinical_df, aes(x = pam50_subtype)) +
+    geom_bar(fill = "purple", alpha = 0.7) +
+    geom_text(stat = "count", aes(label = ..count..), vjust = -0.5) +
+    labs(title = "PAM50 Subtype Distribution", 
+         x = "PAM50 Subtype", y = "Count") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+p_age + p_tumor_size + p_pam50
+```
+
+### 2.2 Expression Data
 
 Compute low-dimensinal embeddings for expresion matrix (PCA, UMAP)
 
@@ -260,7 +314,7 @@ Visualise low-dimensional embeddings by sample_id (check batch effects)
 
 ```{r}
 
-p_pca <- ggplot(pc_scores_df, aes(x = PC1, y = PC2, color = .data[["sample_id"]])) +
+p_pca_sample <- ggplot(pc_scores_df, aes(x = PC1, y = PC2, color = .data[["sample_id"]])) +
     geom_point(alpha = 0.7, size = 2) +
     labs(title = "PCA of Gene Expression Data",
          x = paste0("PC1 (", round(var_explained[1], 2), "%)"),
@@ -269,14 +323,14 @@ p_pca <- ggplot(pc_scores_df, aes(x = PC1, y = PC2, color = .data[["sample_id"]]
     theme(legend.position = "none")
 
 
-p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["sample_id"]])) +
+p_umap_sample <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["sample_id"]])) +
   geom_point(alpha = 0.7, size = 2) +
   labs(title = "UMAP of Gene Expression Data", color = "sample_id") +
   theme_minimal() + 
   theme(legend.position = "none")
 
-p_pca
-p_umap
+p_pca_sample
+p_umap_sample
 ```
 
 Visualize variance explained plots
@@ -323,7 +377,6 @@ Select only highly variable genes using the HVG method
 ```{r}
 set.seed(SEED)
 
-# Mean-variance relationship (more robust)
 select_hvg_mean_var <- function(expression_matrix, top_n) {
   gene_means <- rowMeans(expression_matrix)
   gene_vars <- apply(expression_matrix, 1, var)
@@ -350,10 +403,9 @@ expression_selected <- expression_matrix[top_hvg_genes, ]
 cat("\nSelected", length(top_hvg_genes), "highly variable genes for clustering out of", nrow(expression_matrix), "\n")
 ```
 
-Visualize selected genes
+Visualize features selected
 
 ```{r fig.width=8, fig.height=4}
-# 2. Visualize feature selection
 hvg_df <- data.frame(
   gene_id = names(hvg_result$var_ratio),
   mean_expr = rowMeans(expression_matrix),
@@ -373,43 +425,45 @@ p_hvg_selection <- ggplot(hvg_df, aes(x = mean_expr, y = variance, color = selec
 
 p_hvg_selection
 ```
+
 Compute low-dimensinal embeddings for selected expresion matrix (PCA, UMAP)
 
 ```{r}
 set.seed(SEED)
 
 # PCA
-pca_result <- prcomp(t(expression_selected), center = TRUE, scale. = TRUE)
-pc_scores_df <- data.frame(pca_result$x[, 1:3], sample_id = rownames(pca_result$x))
-pc_scores_df <- left_join(pc_scores_df, clinical_df, by = "sample_id")
+pca_result_selected <- prcomp(t(expression_selected), center = TRUE, scale. = TRUE)
+pc_scores_selected_df <- data.frame(pca_result_selected$x[, 1:3], sample_id = rownames(pca_result_selected$x))
+pc_scores_selected_df <- left_join(pc_scores_selected_df, clinical_df, by = "sample_id")
 
 
 # UMAP
-umap_result <- umap(t(expression_selected))
-umap_df <- data.frame(UMAP1 = umap_result$layout[,1],
-                      UMAP2 = umap_result$layout[,2],
+umap_result_selected <- umap(t(expression_selected))
+umap_selected_df <- data.frame(UMAP1 = umap_result_selected$layout[,1],
+                      UMAP2 = umap_result_selected$layout[,2],
                       sample_id = colnames(expression_selected))
-umap_df <- left_join(umap_df, clinical_df, by = "sample_id")
+umap_selected_df <- left_join(umap_selected_df, clinical_df, by = "sample_id")
 ```
 
 Visualise low-dimensional embeddings by clinical subtype (PAM50)
 
 ```{r}
-p_pca <- ggplot(pc_scores_df, aes(x = PC1, y = PC2, color = .data[["pam50_subtype"]])) +
+p_pca_selected <- ggplot(pc_scores_selected_df, aes(x = PC1, y = PC2, color = .data[["pam50_subtype"]])) +
     geom_point(alpha = 0.7, size = 2) +
     labs(title = "PCA of Gene Expression Data",
          x = paste0("PC1 (", round(var_explained[1], 2), "%)"),
          y = paste0("PC2 (", round(var_explained[2], 2), "%)")) +
     theme_minimal()
 
-p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["pam50_subtype"]])) +
+p_umap_selected <- ggplot(umap_selected_df, aes(x = UMAP1, y = UMAP2, color = .data[["pam50_subtype"]])) +
   geom_point(alpha = 0.7, size = 2) +
   labs(title = "UMAP of Gene Expression Data", color = "pam50_subtype") +
   theme_minimal()
 
-p_pca
-p_umap
+p_pca_selected
+p_umap_selected
 ```
+
 ### Stage 3.2: Feature Normalization
 
 Scale features using Z-score normalization
@@ -440,7 +494,7 @@ for (k in 3:7) {
   cat("Run k-means clustering with k =", k)
 
   km <- kmeans(t(expression_scaled), centers = k, nstart = 25)
-  cluster_assignments[[paste0("k=", k)]] <- km$cluster
+  cluster_assignments[[paste0("k=", k)]] <- as.factor(km$cluster)
   
   # Calculate ARI
   ari <- adjustedRandIndex(km$cluster, clinical_df$pam50_subtype)
@@ -454,6 +508,20 @@ print(ari_scores)
 
 write.csv(cluster_assignments, file = "kmeans_cluster_labels.csv", row.names = FALSE)
 ```
+
+Visualise UMAP by clinical subtype (PAM50) / predicted K-Means labels
+
+```{r fig.width=24, fig.height=12}
+kmeans_umap_df <- left_join(umap_df, cluster_assignments, by = "sample_id")
+
+p_umap_kmeans <- ggplot(kmeans_umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["k=4"]])) +
+  geom_point(alpha = 0.7, size = 2) +
+  labs(title = "UMAP of Gene Expression Data", color = "k=4") +
+  theme_minimal()
+
+p_umap + p_umap_kmeans
+```
+
 ### 3.3.2 Hierarchical clustering
 
 ```{r}
@@ -474,7 +542,7 @@ for (k in 3:7) {
   cat("Run hierarchical clustering with k =", k)
 
   clusters <- cutree(hc, k = k)
-  hclust_assignments[[paste0("k=", k)]] <- clusters
+  hclust_assignments[[paste0("k=", k)]] <- as.factor(clusters)
   
   # Calculate ARI
   ari <- adjustedRandIndex(clusters, clinical_df$pam50_subtype)
@@ -489,6 +557,206 @@ print(ari_scores)
 
 # Save to CSV
 write.csv(hclust_assignments, file = "hclust_cluster_labels.csv", row.names = FALSE)
+```
+
+Visualise UMAP by clinical subtype (PAM50) / predicted Hierarhical Clustering labels
+
+```{r fig.width=24, fig.height=12}
+hclust_umap_df <- left_join(umap_df, hclust_assignments, by = "sample_id")
+
+p_umap_hclust <- ggplot(hclust_umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["k=4"]])) +
+  geom_point(alpha = 0.7, size = 2) +
+  labs(title = "UMAP of Gene Expression Data", color = "k=4") +
+  theme_minimal()
+
+p_umap + p_umap_hclust
+```
+
+### Stage 3.4: Supervised Analysis
+
+### 3.4.1 Prepare Data for Classification
+
+```{r}
+# Check class distribution
+cat("PAM50 Subtype Distribution:\n")
+print(table(clinical_df$pam50_subtype))
+cat("\nClass proportions:\n")
+print(prop.table(table(clinical_df$pam50_subtype)))
+
+prepared_data <- data.frame(
+  pam50_subtype = clinical_df$pam50_subtype,
+  t(expression_scaled)
+)
+
+cat("\nDataset for ML: ", nrow(prepared_data), "samples,", ncol(prepared_data)-1, "features.\n")
+```
+
+Since PAM50 subtypes are imbalanced, we need to handle that -> Undersampling
+
+```{r}
+set.seed(SEED)
+
+# Random Undersampling
+# Sample down to the size of the smallest class (Normal = 221)
+min_class_size <- min(table(prepared_data$pam50_subtype))
+cat("Minimum class size:", min_class_size, "\n")
+
+# Undersample each class to match the smallest class
+undersample_indices <- c()
+for (class_name in names(table(prepared_data$pam50_subtype))) {
+  class_indices <- which(prepared_data$pam50_subtype == class_name)
+  sampled_indices <- sample(class_indices, min_class_size, replace = FALSE)
+  undersample_indices <- c(undersample_indices, sampled_indices)
+}
+
+prepared_data_balanced <- prepared_data[undersample_indices, ]
+print(table(prepared_data_balanced$pam50_subtype))
+```
+Cross validation setup
+
+```{r}
+set.seed(SEED)
+
+evaluate_model <- function(predictions, actual) {
+  cm <- confusionMatrix(predictions, actual)
+  
+  # Calculate per-class metrics
+  per_class_metrics <- cm$byClass[, c("Sensitivity", "Specificity", "Precision", "F1")]
+  
+  # Overall metrics
+  overall_acc <- cm$overall["Accuracy"]
+  balanced_acc <- mean(cm$byClass[, "Balanced Accuracy"], na.rm = TRUE)
+  
+  return(list(
+    confusion_matrix = cm$table,
+    overall_accuracy = overall_acc,
+    balanced_accuracy = balanced_acc,
+    per_class_metrics = per_class_metrics,
+    macro_f1 = mean(per_class_metrics[, "F1"], na.rm = TRUE)
+  ))
+}
+
+summarize_cv_results <- function(fold_results) {
+  summary_df <- data.frame()
+  
+  accuracies <- sapply(fold_results, function(x) x$overall_accuracy)
+  balanced_accs <- sapply(fold_results, function(x) x$balanced_accuracy)
+  macro_f1s <- sapply(fold_results, function(x) x$macro_f1)
+    
+  summary_df <- rbind(summary_df, data.frame(
+    Mean_Accuracy = mean(accuracies, na.rm = TRUE),
+    SD_Accuracy = sd(accuracies, na.rm = TRUE),
+    Mean_Balanced_Accuracy = mean(balanced_accs, na.rm = TRUE),
+    SD_Balanced_Accuracy = sd(balanced_accs, na.rm = TRUE),
+    Mean_Macro_F1 = mean(macro_f1s, na.rm = TRUE),
+    SD_Macro_F1 = sd(macro_f1s, na.rm = TRUE)
+  ))
+  
+  return(summary_df)
+}
+
+cv_folds <- createFolds(prepared_data_balanced$pam50_subtype, k = 5, list = TRUE, returnTrain = FALSE)
+```
+
+### 3.4.2 Random Forest
+
+```{r}
+set.seed(SEED)
+
+fold_results <- list()
+
+for (fold_id in 1:length(cv_folds)) {
+    cat("Running RandomForest CV for fold:", fold_id, "/", length(cv_folds), "\n")
+  
+    test_indices <- cv_folds[[fold_id]]
+    train_indices <- setdiff(1:nrow(prepared_data_balanced), test_indices)
+    
+    train_data <- prepared_data_balanced[train_indices, ]
+    test_data <- prepared_data_balanced[test_indices, ]
+    
+    rf_model <- randomForest(
+        pam50_subtype ~ ., 
+        data = train_data,
+        ntree = 500,
+        mtry = sqrt(ncol(train_data) - 1),
+        importance = TRUE
+    )
+    
+    predictions <- predict(rf_model, test_data)
+    fold_results[[fold_id]] <- evaluate_model(predictions, test_data$pam50_subtype)
+}
+
+cv_summary <- summarize_cv_results(fold_results)
+print(round(cv_summary, 4))
+```
+Train RandomForest model using 1st CV fold and extend predictions over the whole dataset.
+
+```{r}
+test_indices <- cv_folds[[1]]
+train_indices <- setdiff(1:nrow(prepared_data_balanced), test_indices)
+    
+train_data <- prepared_data_balanced[train_indices, ]
+    
+final_model <- randomForest(
+  pam50_subtype ~ ., 
+  data = train_data,
+  ntree = 500,
+  mtry = sqrt(ncol(train_data) - 1),
+  importance = TRUE
+)
+
+# Make predictions on full dataset using final model
+test_data <- prepared_data[setdiff(rownames(prepared_data), rownames(train_data)), ]
+final_predictions <- predict(final_model, test_data[, -1])
+
+final_cm <- confusionMatrix(final_predictions, test_data$pam50_subtype)
+
+cat("Final Model Performance:\n")
+cat("Overall Accuracy:", round(final_cm$overall["Accuracy"], 4), "\n")
+cat("Balanced Accuracy:", round(mean(final_cm$byClass[, "Balanced Accuracy"], na.rm = TRUE), 4), "\n")
+
+p_cm <- ggplot(as.data.frame(final_cm$table), aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 4) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(title = paste("Confusion Matrix"),
+       x = "True PAM50 Subtype", y = "Predicted PAM50 Subtype") +
+  theme_minimal()
+
+p_cm
+```
+```{r}
+importance_df <- data.frame(
+  Gene = rownames(final_model$importance),
+  Mean_Decrease_Accuracy = final_model$importance[, "MeanDecreaseAccuracy"],
+  Mean_Decrease_Gini = final_model$importance[, "MeanDecreaseGini"]
+)
+
+# Sort by importance and get top 20 features
+top_features <- importance_df[order(importance_df$Mean_Decrease_Accuracy, decreasing = TRUE), ][1:20, ]
+
+write.csv(cv_summary, file = "pam50_rf_cv_results.csv", row.names = FALSE)
+write.csv(top_features, file = "pam50_rf_top_features.csv", row.names = FALSE)
+
+print(top_features)
+```
+
+Visualise UMAP by clinical subtype (PAM50) / predicted Random Forest labels
+
+```{r fig.width=24, fig.height=12}
+rf_predictions <- data.frame(
+  pam50_predicted = final_predictions,
+  sample_id = names(final_predictions)
+)
+
+rf_umap_df <- left_join(rf_predictions, umap_df, by = "sample_id")
+
+p_umap_rf <- ggplot(rf_umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["pam50_predicted"]])) +
+  geom_point(alpha = 0.7, size = 2) +
+  labs(title = "UMAP of Gene Expression Data (RF)", color = "pam50_predicted") +
+  theme_minimal()
+
+p_umap + p_umap_rf
 ```
 
 ---
