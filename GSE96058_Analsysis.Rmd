@@ -3,8 +3,8 @@ title: "GSE96058 Breast Cancer RNA-seq Dataset"
 author: "Daniel Incicau"
 date: "2025-07-18"
 output:
-  html_document: default
   pdf_document: default
+  html_document: default
 params:
   seed: 3213124
 ---
@@ -65,10 +65,12 @@ clean_clinical_data <- function(clinical_df) {
   colnames(clinical_df) <- gsub("\\.ch1", "", colnames(clinical_df))
   colnames(clinical_df) <- gsub("\\.+", "_", colnames(clinical_df))
   colnames(clinical_df) <- tolower(colnames(clinical_df))
-  
+  colnames(clinical_df) <- make.names(colnames(clinical_df), unique = TRUE)
+
   clinical_df_clean <- clinical_df %>%
     select(
       sample_id,
+      instrument_model,
       age_at_diagnosis,
       tumor_size,
       lymph_node_status,
@@ -87,6 +89,7 @@ clean_clinical_data <- function(clinical_df) {
   
   clinical_df_clean <- clinical_df_clean %>%
     mutate(
+      instrument_model = as.factor(instrument_model),
       age_at_diagnosis = as.numeric(age_at_diagnosis),
       tumor_size = as.numeric(tumor_size),
       er_status = as.factor(er_status),
@@ -115,7 +118,6 @@ filter_low_expression_genes <- function(
   
   # Keep genes expressed in sufficient samples
   keep_expressed <- samples_expressing >= min_samples
-  
   expression_filtered <- expression_matrix[keep_expressed, ]
   
   cat("Genes passing expression filter:", sum(keep_expressed), 
@@ -125,13 +127,15 @@ filter_low_expression_genes <- function(
   return(expression_filtered)
 }
 
+# The original data was was post-processed by collapsing on 30,865 unique gene symbols (sum of FPKM values of each matching transcript), adding to each expression measurement 0.1 FPKM, and performing a log2 transformation.
+
 # Remove technical replicates (keep primary samples) 
 primary_samples <- colnames(expression_matrix)[!grepl("repl", colnames(expression_matrix))]
 expression_matrix <- expression_matrix[, primary_samples]
 
 # Filter low expression genes
 # log2(FPKM) > 0 means FPKM > 1
-# Expressed in ≥10% of samples (≥341 samples)
+# Expressed in >=10% of samples (>=341 samples)
 expression_matrix <- filter_low_expression_genes(expression_matrix, min_log2_expr=0, min_sample_fraction=0.1)
 
 # Clean clinical data
@@ -141,8 +145,6 @@ clinical_df <- clean_clinical_data(clinical_data)
 common_samples <- intersect(colnames(expression_matrix), rownames(clinical_df))
 expression_matrix <- expression_matrix[, common_samples]
 clinical_df <- clinical_df[common_samples, ]
-
-# The resulting data was was post-processed by collapsing on 30,865 unique gene symbols (sum of FPKM values of each matching transcript), adding to each expression measurement 0.1 FPKM, and performing a log2 transformation.
 
 cat("Dataset dimensions:", dim(expression_matrix), "\n")
 cat("Number of genes:", nrow(expression_matrix), "\n")
@@ -173,10 +175,7 @@ print(missing_summary)
 
 ### 1.3 Quality Control Visualizations
 
-```{r fig.width=12, fig.height=12}
-set.seed(SEED)
-
-# QC metrics calculation
+```{r fig.width=12, fig.height=6}
 qc_df <- data.frame(
   sample_id = colnames(expression_matrix),
   total_expression = colSums(expression_matrix),
@@ -199,26 +198,38 @@ p_detected_genes <- ggplot(qc_df, aes(x = detected_genes)) +
   labs(title = "Detected Genes per Sample", x = "# Genes with Expression > 0", y = "Sample Count") +
   theme_minimal()
 
-# Sample-sample correlation matrix heatmap (subset)
+
+p_total_expr + p_detected_genes
+```
+
+Visualise sample-sample correlation matrix heatmap (subset of 50)
+
+```{r fig.width=9, fig.height=9}
+set.seed(SEED)
+
 sample_subset <- sample(colnames(expression_matrix), min(50, ncol(expression_matrix)))
+sample_metadata <- clinical_df[sample_subset, ]
 cor_matrix <- cor(expression_matrix[, sample_subset])
+
+annotation_df <- data.frame(Group = sample_metadata$pam50_subtype)
+rownames(annotation_df) <- sample_metadata$sample_id
 
 pheatmap(cor_matrix,
          main = "Sample Correlation Matrix (Subset of 50)",
+         annotation_col = annotation_df[sample_subset, , drop=FALSE],
          show_rownames = FALSE, show_colnames = FALSE,
          clustering_distance_rows = "euclidean",
          clustering_distance_cols = "euclidean",
          clustering_method = "ward.D2",
          color = colorRampPalette(c("blue", "white", "red"))(100))
 
-# Combine two QC histograms
-p_total_expr + p_detected_genes
 ```
 
-```{r fig.width=20, fig.height=12}
+Visualise expression per sample (subset of 10)
+
+```{r fig.width=18, fig.height=9}
 set.seed(SEED)
 
-# Boxplot of expression distributions per sample (subset)
 expr_subset <- expression_matrix[, sample(1:ncol(expression_matrix), min(10, ncol(expression_matrix)))]
 expr_subset_df <- reshape2::melt(expr_subset)
 colnames(expr_subset_df) <- c("Gene", "Sample", "Expression")
@@ -293,26 +304,26 @@ umap_df <- left_join(umap_df, clinical_df, by = "sample_id")
 
 Visualise low-dimensional embeddings by clinical subtype (PAM50)
 
-```{r}
+```{r fig.width=18, fig.height=9}
 p_pca <- ggplot(pc_scores_df, aes(x = PC1, y = PC2, color = .data[["pam50_subtype"]])) +
     geom_point(alpha = 0.7, size = 2) +
     labs(title = "PCA of Gene Expression Data",
          x = paste0("PC1 (", round(var_explained[1], 2), "%)"),
          y = paste0("PC2 (", round(var_explained[2], 2), "%)")) +
-    theme_minimal()
+    theme_minimal() +
+    theme(legend.position = "none")
 
 p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["pam50_subtype"]])) +
   geom_point(alpha = 0.7, size = 2) +
   labs(title = "UMAP of Gene Expression Data", color = "pam50_subtype") +
   theme_minimal()
 
-p_pca
-p_umap
+p_pca + p_umap
 ```
 
 Visualise low-dimensional embeddings by sample_id (check batch effects)
 
-```{r}
+```{r fig.width=27, fig.height=9}
 
 p_pca_sample <- ggplot(pc_scores_df, aes(x = PC1, y = PC2, color = .data[["sample_id"]])) +
     geom_point(alpha = 0.7, size = 2) +
@@ -329,13 +340,18 @@ p_umap_sample <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["sampl
   theme_minimal() + 
   theme(legend.position = "none")
 
-p_pca_sample
-p_umap_sample
+p_umap_instrument <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["instrument_model"]])) +
+  geom_point(alpha = 0.7, size = 2) +
+  labs(title = "UMAP of Gene Expression Data", color = "instrument_model") +
+  theme_minimal() + 
+  theme(legend.position = "none")
+
+p_pca_sample + p_umap_sample + p_umap_instrument
 ```
 
 Visualize variance explained plots
 
-```{r}
+```{r fig.width=18, fig.height=9}
 # Scree plot (top 20 PCs)
 scree_data <- data.frame(
   PC = paste0("PC", 1:20),
@@ -364,8 +380,7 @@ p_variance_cumsum <- ggplot(cumsum_df, aes(x = PC, y = CumulativeVariance)) +
        y = "Cumulative Variance Explained (%)") +
   theme_minimal()
 
-p_variance
-p_variance_cumsum
+p_variance + p_variance_cumsum
 ```
 
 ## Stage 3: Analysis
@@ -395,7 +410,6 @@ select_hvg_mean_var <- function(expression_matrix, top_n) {
 }
 
 # Use HVG method (most robust for RNA-seq)
-# top_n = 1000 (explains 90% of the variance)
 hvg_result <- select_hvg_mean_var(expression_matrix, top_n = 1000)
 top_hvg_genes <- hvg_result$genes
 expression_selected <- expression_matrix[top_hvg_genes, ]
@@ -405,7 +419,7 @@ cat("\nSelected", length(top_hvg_genes), "highly variable genes for clustering o
 
 Visualize features selected
 
-```{r fig.width=8, fig.height=4}
+```{r fig.width=10, fig.height=10}
 hvg_df <- data.frame(
   gene_id = names(hvg_result$var_ratio),
   mean_expr = rowMeans(expression_matrix),
@@ -419,7 +433,7 @@ p_hvg_selection <- ggplot(hvg_df, aes(x = mean_expr, y = variance, color = selec
   scale_color_manual(values = c("FALSE" = "lightgray", "TRUE" = "red")) +
   geom_smooth(method = "loess", se = TRUE, color = "blue", linetype = "dashed") +
   labs(title = "Highly Variable Gene Selection",
-       subtitle = paste("Selected", sum(hvg_df$selected), "genes (red points) out of", nrow(expression_matrix)),
+       subtitle = paste("Selected", sum(hvg_df$selected), "genes out of", nrow(expression_matrix)),
        x = "Mean Expression", y = "Variance", color = "Selected") +
   theme_minimal()
 
@@ -447,21 +461,21 @@ umap_selected_df <- left_join(umap_selected_df, clinical_df, by = "sample_id")
 
 Visualise low-dimensional embeddings by clinical subtype (PAM50)
 
-```{r}
+```{r fig.width=18, fig.height=9}
 p_pca_selected <- ggplot(pc_scores_selected_df, aes(x = PC1, y = PC2, color = .data[["pam50_subtype"]])) +
     geom_point(alpha = 0.7, size = 2) +
     labs(title = "PCA of Gene Expression Data",
          x = paste0("PC1 (", round(var_explained[1], 2), "%)"),
          y = paste0("PC2 (", round(var_explained[2], 2), "%)")) +
-    theme_minimal()
+    theme_minimal() +
+    theme(legend.position = "none")
 
 p_umap_selected <- ggplot(umap_selected_df, aes(x = UMAP1, y = UMAP2, color = .data[["pam50_subtype"]])) +
   geom_point(alpha = 0.7, size = 2) +
   labs(title = "UMAP of Gene Expression Data", color = "pam50_subtype") +
   theme_minimal()
 
-p_pca_selected
-p_umap_selected
+p_pca_selected + p_umap_selected
 ```
 
 ### Stage 3.2: Feature Normalization
@@ -511,7 +525,7 @@ write.csv(cluster_assignments, file = "kmeans_cluster_labels.csv", row.names = F
 
 Visualise UMAP by clinical subtype (PAM50) / predicted K-Means labels
 
-```{r fig.width=24, fig.height=12}
+```{r fig.width=18, fig.height=9}
 kmeans_umap_df <- left_join(umap_df, cluster_assignments, by = "sample_id")
 
 p_umap_kmeans <- ggplot(kmeans_umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["k=4"]])) +
@@ -561,7 +575,7 @@ write.csv(hclust_assignments, file = "hclust_cluster_labels.csv", row.names = FA
 
 Visualise UMAP by clinical subtype (PAM50) / predicted Hierarhical Clustering labels
 
-```{r fig.width=24, fig.height=12}
+```{r fig.width=18, fig.height=9}
 hclust_umap_df <- left_join(umap_df, hclust_assignments, by = "sample_id")
 
 p_umap_hclust <- ggplot(hclust_umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["k=4"]])) +
@@ -732,8 +746,8 @@ importance_df <- data.frame(
   Mean_Decrease_Gini = final_model$importance[, "MeanDecreaseGini"]
 )
 
-# Sort by importance and get top 20 features
-top_features <- importance_df[order(importance_df$Mean_Decrease_Accuracy, decreasing = TRUE), ][1:20, ]
+# Sort by importance and get top 50 features
+top_features <- importance_df[order(importance_df$Mean_Decrease_Accuracy, decreasing = TRUE), ][1:50, ]
 
 write.csv(cv_summary, file = "pam50_rf_cv_results.csv", row.names = FALSE)
 write.csv(top_features, file = "pam50_rf_top_features.csv", row.names = FALSE)
@@ -743,7 +757,7 @@ print(top_features)
 
 Visualise UMAP by clinical subtype (PAM50) / predicted Random Forest labels
 
-```{r fig.width=24, fig.height=12}
+```{r fig.width=9, fig.height=9}
 rf_predictions <- data.frame(
   pam50_predicted = final_predictions,
   sample_id = names(final_predictions)
@@ -756,7 +770,7 @@ p_umap_rf <- ggplot(rf_umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["pam50_
   labs(title = "UMAP of Gene Expression Data (RF)", color = "pam50_predicted") +
   theme_minimal()
 
-p_umap + p_umap_rf
+p_umap_rf
 ```
 
 ---
