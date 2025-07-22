@@ -755,9 +755,57 @@ write.csv(top_features, file = "pam50_rf_top_features.csv", row.names = FALSE)
 print(top_features)
 ```
 
+Visualise feature importance
+
+```{r fig.width=18, fig.height=9}
+PAM50_GENES <- c("ESR1", "ERBB2", "AURKA", "BIRC5", "CCNB1", "MYBL2", "MMP11", "PTTG1", 
+                 "UBE2C", "RRM2", "TYMS", "CEP55", "MELK", "NDC80", "NUF2", "UBE2T",
+                 "CDC20", "CCNE1", "MKI67", "PCNA", "TOP2A", "TPX2", "BUB1B", "CENPU",
+                 "ANLN", "BAG1", "BCL2", "BLVRA", "CCND1", "CDC6", "CDCA1", "CDH3",
+                 "CENPF", "EGFR", "ERBB3", "EXO1", "FGFR4", "FOXA1", "FOXC1", "GPR160",
+                 "GRB7", "KIF2C", "KNTC2", "KRT14", "KRT17", "KRT5", "MAPT", "MDM2",
+                 "MLPH", "MYC", "NAT1", "ORC6L", "PGR", "PHGDH", "PTTG1", "SLC39A6")
+
+top_20_genes <- importance_df %>%
+  arrange(desc(Mean_Decrease_Accuracy)) %>%
+  head(20) %>%
+  mutate(Gene = factor(Gene, levels = Gene)) %>%
+  mutate(is_pam50 = Gene %in% PAM50_GENES, 
+         gene_color = ifelse(is_pam50, "#DC6027", "#0028A5"))
+
+
+feature_importance_plot <- ggplot(top_20_genes, aes(x = reorder(Gene, Mean_Decrease_Accuracy), 
+                                                    y = Mean_Decrease_Accuracy)) +
+  geom_col(aes(fill = is_pam50), alpha = 0.8, width = 0.7) +
+  scale_fill_manual(values = c("FALSE" = "#0028A5", "TRUE" = "#DC6027"),
+                   labels = c("Other genes", "PAM50 genes"),
+                   name = "Gene Type") +
+  labs(
+    title = "Top 20 Most Important Genes for PAM50 Classification",
+    x = "Gene",
+    y = "Mean Decrease in Accuracy",
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+    axis.text.x = element_text(size = 9, angle = 45, hjust = 1, face = "bold"),
+    axis.text.y = element_text(size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    legend.position = "top",
+    legend.title = element_text(face = "bold"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.caption = element_text(size = 9, color = "gray50", hjust = 1)
+  ) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, max(top_20_genes$Mean_Decrease_Accuracy) * 1.1))
+
+feature_importance_plot
+```
+
 Visualise UMAP by clinical subtype (PAM50) / predicted Random Forest labels
 
-```{r fig.width=9, fig.height=9}
+```{r fig.width=18, fig.height=9}
 rf_predictions <- data.frame(
   pam50_predicted = final_predictions,
   sample_id = names(final_predictions)
@@ -768,9 +816,10 @@ rf_umap_df <- left_join(rf_predictions, umap_df, by = "sample_id")
 p_umap_rf <- ggplot(rf_umap_df, aes(x = UMAP1, y = UMAP2, color = .data[["pam50_predicted"]])) +
   geom_point(alpha = 0.7, size = 2) +
   labs(title = "UMAP of Gene Expression Data (RF)", color = "pam50_predicted") +
-  theme_minimal()
+  theme_minimal() +
+  theme(legend.position = "none")
 
-p_umap_rf
+p_umap + p_umap_rf
 ```
 
 ---
